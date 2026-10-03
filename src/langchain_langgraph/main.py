@@ -1,42 +1,51 @@
 # import os  # 使用 os 模組來獲取環境變數
 
 from dotenv import load_dotenv
-from langchain_core.prompts import PromptTemplate
-from langchain_openai import ChatOpenAI
-from langchain_ollama import ChatOllama
-
 
 load_dotenv()  # 載入環境變數 from .env file
 
+from langchain.agents import create_agent  # 匯入建立 agent 的函式
+from langchain.tools import tool  # 匯入將函式轉為 LangChain 工具的裝飾器
+from langchain_core.messages import HumanMessage  # 匯入表示使用者訊息的類別
+from langchain_openai import ChatOpenAI  # 匯入 ChatOpenAI 聊天模型類別
+from tavily import TavilyClient  # 匯入 Tavily 搜尋用戶端類別
+
+tavily = TavilyClient()
+
+
+# @tool 會把這個函式轉成 LLM 可以呼叫的工具，LLM 收到的「工具說明書」如下：
+#   - name        ← 函式名稱 "search"
+#   - description ← 整段 docstring（原封不動，包含 Args / Returns 文字）
+#   - parameters  ← 型別提示：query 必須是 string
+# LLM 看不到函式內部的程式碼，只能靠上面三項判斷「何時使用」和「傳什麼參數」。
+# 注意：這些 # 註解不會送給 LLM，只有 docstring 會。
+@tool
+def search(query: str) -> dict:
+    """
+    在網路上搜尋資訊的工具
+    Args:
+        query: 要搜尋的關鍵字
+    Returns:
+        搜尋結果
+    """
+    print(f"正在搜尋：{query}")  # LLM 決定呼叫此工具時，會自己產生 query，例如 "東京 天氣"
+    return tavily.search(query=query)  # 這個回傳值會被送回 LLM，LLM 再根據它整理出最終回答
+
+llm = ChatOpenAI(model="gpt-5-nano", temperature=0)  # 創建 ChatOpenAI 物件，這個物件會呼叫 OpenAI API 來產生 LLM 回答
+tools = [search]  # 把 search 工具放進 tools list
+agent = create_agent(model=llm, tools=tools)  # 創建 agent，並把 llm 與 tools 傳入
+
 
 def main() -> None:
-    print("Hello from langchain-langgraph!")
     # print(os.getenv("OPENAI_API_KEY"))
+    # print(os.getenv("TAVILY_API_KEY"))
+    print("Hello from langchain-langgraph!")
 
-    information = """
-    馬斯克出生於南非比勒陀利亞的富裕家庭，1989年隨家人移民加拿大；由於母親出生於加拿大，他擁有加拿大國籍。 1997年，他從賓州大學獲得學士學位，之後前往加州發展商業。 1995年，馬斯克共同創辦了網路軟體公司Zip2。 1999年Zip2出售後，他又共同創辦了電子商務支付系統X.com 。 2000年3月， X.com與Confinity合併，成立了PayPal，後者於2002年被eBay收購。同年，馬斯克也加入了美國國籍。
-    2002年，馬斯克創立了太空科技公司SpaceX，並擔任執行長兼首席工程師；該公司此後在可重複使用火箭和商業航太領域引領創新。 2004年，馬斯克以早期投資者身分加入特斯拉，並於2008年成為其執行長兼產品架構師；特斯拉此後成為電動車領域的領導者。 2015年，馬斯克共同創立了OpenAI，旨在推進人工智慧（AI）研究，但後來離開了該公司。他對特斯拉在2020年代人工智慧熱潮中的發展方向和領導層日益不滿，這促使他創立了xAI，該公司於2026年成為SpaceX的子公司。 2022年，他收購了社交網路服務公司Twitter ，並對其進行了重大改革，包括在2023年將其更名為X。他的其他企業包括他於2016年共同創立的神經科技公司Neuralink ，以及他於2017年創立的隧道公司The Boring Company。 2025年11月，特斯拉批准了一項價值1兆美元的薪酬方案，如果特斯拉達到某些里程碑（例如市值達到8.5兆美元），馬斯克將在10年內分期領取這筆款項。 2026年6月SpaceX首次公開募股後，馬斯克成為首位身價兆美元的美國富豪，但SpaceX股價暴跌，導致他隔月便跌破了這一門檻。
-    """
-    prompt_template = """
-    請用以下資料來總結馬斯克的生平：
-    1. 簡短的摘要
-    2. 兩個有趣的關鍵點
-    {information}
-    """
-    # 初始化 LLM
-    openai_llm = ChatOpenAI(model="gpt-5-nano", temperature=0)
-    ollama_llm = ChatOllama(model="gemma3:4b", temperature=0)
-
-    # 1. 將 prompt template 轉換為 prompt
-    prompt = PromptTemplate.from_template(
-        prompt_template
-    )  
-    # 2. 將 prompt 和 llm 串接起來
-    chain = prompt | openai_llm  
-    # 3. 執行 chain
-    response = chain.invoke(input={"information": information})  
-    # 4. 印出 response
-    print(response.content)  
+    # 這裡的 agent.invoke() 會把 HumanMessage 送給 LLM，LLM 會判斷要不要呼叫 search 工具，並把結果整理成最終回答。
+    result = agent.invoke({
+        "messages": [HumanMessage(content="請幫我搜尋東京的天氣")]
+    })
+    print(f"搜尋結果：{result}")
 
 
 main()
