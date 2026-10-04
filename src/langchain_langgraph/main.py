@@ -1,10 +1,6 @@
-"""用 Ollama SDK 手刻 agent loop（對照組：上一版的 LangChain `.bind_tools`）。
-
-兩版送給模型的 tool schema 完全相同，差異只在抽象層。
-以下 Difference #1~#8 標出 LangChain 幫你做掉、這裡要自己寫的部分。
-"""
-
-from typing import Any
+import json
+import re
+import inspect
 from dotenv import load_dotenv
 
 load_dotenv()  # 載入環境變數 from .env file
@@ -17,9 +13,6 @@ MODEL = "qwen3:1.7b"
 
 
 # --- Tools ---
-# Difference #1：工具註冊
-#   @tool（產生 schema + 自動 tracing） → @traceable（只有 tracing）
-#   所以 docstring 不會進 prompt，真正的描述在下方 tools_for_llm。
 # 依產品名稱查詢價格。
 @traceable(run_type="tool")
 def get_product_price(product_name: str) -> float:
@@ -30,7 +23,7 @@ def get_product_price(product_name: str) -> float:
     return prices.get(product_name, 0.0)  # 如果產品名稱不存在，返回 0.0
 
 
-# 依價格和折扣等級計算折後價格；不支援的等級不打折。
+# 依價格和折扣等級計算折後價格。
 @traceable(run_type="tool")
 def apply_discount(price: float, discount_tier: str) -> float:
     """根據價格和折扣等級計算折扣後的價格。Available discount tiers: 'gold', 'silver', 'bronze'."""
@@ -40,145 +33,129 @@ def apply_discount(price: float, discount_tier: str) -> float:
     return round(price * (1 - discount / 100), 2)
 
 
-# Difference #2：schema 來源
-#   簽章 + docstring 自動產生 → 手寫 JSON Schema（內容與上一版等價）
-#   代價：改了函式簽章，這裡不會跟著改。
-tools_for_llm = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_product_price",
-            "description": "根據產品名稱獲取產品價格。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "product_name": {
-                        "type": "string",
-                    }
-                },
-                "required": ["product_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_discount",
-            "description": "根據價格和折扣等級計算折扣後的價格。Available discount tiers: 'gold', 'silver', 'bronze'.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "price": {
-                        "type": "number",
-                    },
-                    "discount_tier": {
-                        "type": "string",
-                    },
-                },
-                "required": ["price", "discount_tier"],
-            },
-        },
-    },
-]
+tools = {
+    "get_product_price": get_product_price,
+    "apply_discount": apply_discount,
+}
 
 
-# Difference #3：模型與工具綁定
-#   init_chat_model + .bind_tools（可換 provider、工具記住） → ollama.chat 寫死，每輪自己帶 tools
+# 將工具名稱、參數和 docstring 整理成文字。
+def get_tool_descriptions(tools_dict):
+    descriptions = []  # 收集各工具說明
+    for tool_name, tool_function in tools_dict.items():
+        # 取得裝飾前的函式簽章，避免看到裝飾器包裝參數
+        original_function = getattr(tool_function, "__wrapped__", tool_function)
+        signature = inspect.signature(original_function)
+        docstring = inspect.getdoc(tool_function) or ""
+        descriptions.append(f"{tool_name}{signature} - {docstring}")
+    return "\n".join(descriptions)
+
+
+tool_descriptions = get_tool_descriptions(tools)  # 產生所有工具的說明文字
+tool_names = ", ".join(tools.keys())  # 產生所有工具的名稱列表
+
+react_prompt = f"""
+嚴格規則：
+1. 回答產品價格或折扣問題時，必須使用工具。
+2. 不得捏造價格或折扣。
+3. 使用 get_product_price 取得產品價格後，必須呼叫 apply_discount。
+4. 傳給 apply_discount 的價格必須與查得的價格完全相同，不得四捨五入或修改。
+5. 不得將捏造的價格傳給 apply_discount。
+6. 如果使用者未提供折扣等級，請詢問使用者折扣等級。不要假設。
+
+Answer the following questions as best you can. You have access to the following tools:
+
+{tool_descriptions}
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Begin!
+
+Question: {{question}}
+Thought:"""
+
+
 @traceable(name="Ollama Chat", run_type="llm")
-def ollama_chat_traced(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    """使用 Ollama API 呼叫聊天模型，並追蹤訊息。"""
-    print(f"    >> 呼叫 Ollama API，訊息數量：{len(messages)}")
-    response = ollama.chat(
-        MODEL,
-        messages=messages,
-        tools=tools_for_llm,  # ← 每一輪都要重新傳，沒有 bind_tools 幫你記住
-        options={"temperature": 0},
-    )  # 呼叫 Ollama API，傳入訊息、工具列表和模型參數
+def ollama_chat_traced(model, messages, options):
+    response = ollama.chat(model=MODEL, messages=messages, options=options)
     return response
 
 
 # --- Agent ---
-@traceable(name="run_agent-RAW")
-def run_agent(question: str) -> None | str | list[str | dict[Any, Any]]:
-    # Difference #4：工具查找表
-    #   {t.name: t for t in tools} → 手打字串 key，要跟 tools_for_llm 的 name 人工同步
-    tools_dict = {
-        "get_product_price": get_product_price,
-        "apply_discount": apply_discount,
-    }
-
+@traceable(name="run_agent-ReAct")
+def run_agent(question: str):
     print(f"Question : {question}")
     print("=" * 60)
 
-    # Difference #5：訊息格式
-    #   SystemMessage / HumanMessage → 原始 dict，看得到真實 payload，但沒有型別檢查
-    # 建立訊息列表，包含系統訊息和使用者訊息
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "你是一位樂於助人的購物助理。\n"
-                "你可以使用以下工具：get_product_price、apply_discount。\n\n"
-                "嚴格規則：\n"
-                "1. 回答產品價格或折扣問題時，必須使用工具。\n"
-                "2. 不得捏造價格或折扣。\n"
-                "3. 使用 get_product_price 取得產品價格後，必須呼叫 apply_discount。\n"
-                "4. 傳給 apply_discount 的價格必須與查得的價格完全相同，不得四捨五入或修改。\n"
-                "5. 不得將捏造的價格傳給 apply_discount。\n"
-                "6. 如果使用者未提供折扣等級，請詢問使用者折扣等級。不要假設。"
-            )
-        },
-        {"role": "user", "content": question},
-    ]  # 初始化訊息列表，包含系統訊息和使用者訊息
+    prompt = react_prompt.format(question=question)
+    scratchpad = ""
 
     # --- Agent loop ---
     for iteration in range(1, MAX_ITERATIONS + 1):
         print(f"\n--- Iteration {iteration} ---")
 
-        # Difference #6：回應形狀
-        #   llm.invoke() → AIMessage（跨 provider 已正規化） → ChatResponse，要先 .message
-        ollama_response = ollama_chat_traced(messages=messages)  # 呼叫聊天模型並取得模型回應
-        model_response = ollama_response.message  # 將模型回應存入 model_response 變數
+        full_prompt = prompt + scratchpad  # 將 prompt 與 scratchpad 組合成完整的 prompt
 
-        tool_call_requests = model_response.tool_calls  # 取得模型提出的工具呼叫請求
+        ollama_response = ollama_chat_traced(
+            model=MODEL,
+            messages=[{"role": "user", "content": full_prompt}],
+            options={"stop": ["Observation:"], "temperature": 0},
+        )  # 呼叫聊天模型並取得模型回應
+        model_response = ollama_response.message.content  # 將模型回應存入 model_response 變數
+        print(f"Model Response: {model_response}")
 
-        # 1. 如果有工具呼叫，則執行工具並將結果加入訊息列表
-        if not tool_call_requests:
-            print(f"\n Final Answer: {model_response.content}")  # 如果沒有工具呼叫，表示 AI 已經給出最終答案，打印最終答案並返回
-            return model_response.content
+        print(f"  >> [Parsing] 尋找 Final Answer in LLM model_response...")
+        final_answer_match = re.search(r"Final Answer:\s*(.+)", model_response, re.IGNORECASE)
+        if final_answer_match:
+            final_answer = final_answer_match.group(1).strip()
+            print(f"  >> [Parsed] 找到 Final Answer: {final_answer}")
+            print("\n" + "=" * 60)
+            print(f"Final Answer: {final_answer}")
+            return final_answer  # 如果模型回應中包含最終答案，則返回該答案
 
-        # 2. 保留模型提出的工具呼叫，讓下一輪訊息包含完整脈絡
-        messages.append(model_response)
+        print(f"  >> [Parsing] 尋找 Action and Action Input in LLM model_response...")
+        action_match = re.search(r"Action:\s*(.+)", model_response)
+        action_input_match = re.search(r"Action Input:\s*(.+)", model_response)
 
-        # 3. 取得第一個工具呼叫請求，拆出工具名稱與參數
-        #    （承 #6）上一版：tc.get("name") / tc.get("args") / tc.get("id")
-        #            這一版：巢狀物件屬性，且沒有 id
-        tool_call_request = tool_call_requests[0]
-        requested_tool_name = tool_call_request.function.name
-        tool_arguments = tool_call_request.function.arguments
+        if not action_match or not action_input_match:
+            print(
+                "  [Parsing] ERROR: 無法解析模型回應中的 Action 或 Action Input。請檢查模型回應格式。"
+            )
+            break
+
+        tool_name = action_match.group(1).strip()
+        tool_input_raw = action_input_match.group(1).strip()
 
         print(
-            f"    >> [Tool Selected] 準備執行工具：{requested_tool_name}，"
-            f"參數：{tool_arguments}"
+            f"    >> [Tool Selected] 準備執行工具：{tool_name}，"
+            f"參數：{tool_input_raw}"
         )
 
-        # 4. 根據工具名稱選擇對應的工具
-        selected_tool = tools_dict.get(requested_tool_name)
-        if selected_tool is None:
-            raise ValueError(f"找不到工具：{requested_tool_name}")
+        print(f"    >> [Tool Executing] 執行工具 {tool_name}...")
+        if tool_name not in tools:
+            observation = f"Error: 工具 {tool_name} 不存在。"
+        else:
+            try:
+                tool_arguments = json.loads(tool_input_raw)
+            except json.JSONDecodeError as error:
+                observation = f"Error: Action Input 不是有效的 JSON：{error}"
+            else:
+                if not isinstance(tool_arguments, dict):
+                    observation = "Error: Action Input 必須是 JSON object。"
+                else:
+                    observation = str(tools[tool_name](**tool_arguments))
 
-        # Difference #7：執行工具
-        #   tool.invoke(tool_call)（自動解包 + Pydantic 驗型） → 自己 **kwargs 展開，無驗型
-        tool_result = selected_tool(**tool_arguments)  # 執行模型提出的工具呼叫
-        print(f"    >> [Tool Result] 工具執行結果：{tool_result}")
-
-        # Difference #8：回填結果
-        #   .invoke() 直接回傳 ToolMessage → 自己組 dict、自己 str() 轉型
-        messages.append({
-            "role": "tool",
-            "tool_name": requested_tool_name,
-            "content": str(tool_result),
-        })  # 把工具結果交回模型，供下一輪使用
+        print(f"    >> [Tool Result] 工具 {tool_name} 執行結果：{observation}")
+        scratchpad += f"\n{model_response}\nObservation: {observation}\nThought:"
 
     print("\n已達到最大迭代次數，仍未得到最終答案。")
     return None
