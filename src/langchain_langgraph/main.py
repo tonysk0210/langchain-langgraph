@@ -98,7 +98,7 @@ def ollama_chat_traced(messages: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 # --- Agent ---
-@traceable(name="run_agent")
+@traceable(name="run_agent-RAW")
 def run_agent(question: str) -> None | str | list[str | dict[Any, Any]]:
     # Difference #4：工具查找表
     #   {t.name: t for t in tools} → 手打字串 key，要跟 tools_for_llm 的 name 人工同步
