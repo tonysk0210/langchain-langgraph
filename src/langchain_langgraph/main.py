@@ -1,16 +1,13 @@
 import os
-from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()  # 載入環境變數 from .env file
 
+from pathlib import Path
 from langchain_openai import OpenAIEmbeddings
 from langchain_unstructured import UnstructuredLoader  # 匯入 UnstructuredLoader 類別，用於處理非結構化資料
 from langchain_text_splitters import CharacterTextSplitter  # 匯入 CharacterTextSplitter 類別，用於將文字分割成較小的片段
 from langchain_pinecone import Pinecone  # 匯入 Pinecone 類別，用於與 Pinecone 向量資料庫互動
-
-
-from langsmith import traceable  # 匯入 traceable 裝飾器，用於追蹤函式的執行
 
 if __name__ == "__main__":
     print("Hello from langchain-langgraph!")
@@ -30,4 +27,3 @@ if __name__ == "__main__":
     print("正在將片段寫入 Pinecone...")
     pineconeVectorStore = Pinecone.from_documents(chunks, embeddings, index_name=os.environ["INDEX_NAME"])  # 將分割後的片段和向量表示存入 Pinecone 向量資料庫，指定索引名稱
     print("已完成將片段寫入 Pinecone")
-
