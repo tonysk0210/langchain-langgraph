@@ -24,6 +24,7 @@ dependencies = [
     "python-dotenv>=1.2.4",
     "python-magic-standalone>=0.4.28",
     "ruff>=0.16.10",
+    "streamlit>=1.65.0",
     "tavily>=1.1.0",
     "tavily-python>=0.8.4",
     "unstructured>=0.27.22",
